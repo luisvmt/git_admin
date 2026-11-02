@@ -7,6 +7,9 @@ RAMA_PRINCIPAL="${RAMA_PRINCIPAL:-main}"
 VISIBILIDAD_POR_DEFECTO="${VISIBILIDAD_POR_DEFECTO:-private}"
 ARCHIVOS_IGNORAR_POR_DEFECTO="${ARCHIVOS_IGNORAR_POR_DEFECTO:-bin/ obj/ .vs/ node_modules/ *.log *.tmp *.user *.suo .DS_Store Thumbs.db}"
 
+# Variable de salida de leer_opcion_menu().
+MENU_OPCION=""
+
 if [[ -t 1 ]]; then
   C_RESET=$'\e[0m'
   C_NEGRITA=$'\e[1m'
@@ -45,6 +48,68 @@ confirmar_texto() {
   local respuesta=""
   read -rp "$pregunta " respuesta || true
   [[ "$respuesta" == "$esperado" ]]
+}
+
+# Lee la opción del menú principal, tecla a tecla, para poder detectar
+# ESC sin esperar a un salto de línea (ENTER vacío y ESC dejan MENU_OPCION
+# vacía: el llamador solo refresca la ventana).
+# Si la entrada no es una terminal (tuberías, pruebas), usa una lectura de
+# línea normal y descarta los valores vacíos o con ESC.
+# Devuelve 1 si se alcanzó el fin de la entrada (EOF).
+leer_opcion_menu() {
+  local tecla=""
+  local opcion=""
+  local resto=""
+  MENU_OPCION=""
+
+  # Entrada no interactiva: lectura de línea tradicional.
+  if [[ ! -t 0 ]]; then
+    IFS= read -r opcion || return 1
+    if [[ -z "$opcion" || "$opcion" == *$'\e'* ]]; then
+      opcion=""
+    fi
+    MENU_OPCION="$opcion"
+    return 0
+  fi
+
+  printf 'Opción: '
+  while true; do
+    IFS= read -rsn1 tecla || {
+      printf '\n'
+      return 1
+    }
+    case "$tecla" in
+      $'\e')
+        # ESC: si llega una secuencia de escape (flechas: ESC [ A, ESC O A)
+        # se descarta; una tecla suelta posterior se consume sin efecto.
+        if IFS= read -rsn1 -t 0.05 resto; then
+          if [[ "$resto" == "[" || "$resto" == "O" ]]; then
+            while IFS= read -rsn1 -t 0.05 resto; do :; done
+          fi
+        fi
+        printf '\n'
+        MENU_OPCION=""
+        return 0
+        ;;
+      "")
+        # ENTER: fin de la lectura.
+        printf '\n'
+        MENU_OPCION="$opcion"
+        return 0
+        ;;
+      $'\x7f'|$'\b')
+        # Retroceso: borrar el último carácter tecleado.
+        if (( ${#opcion} > 0 )); then
+          opcion="${opcion%?}"
+          printf '\b \b'
+        fi
+        ;;
+      *)
+        opcion+="$tecla"
+        printf '%s' "$tecla"
+        ;;
+    esac
+  done
 }
 
 requiere_git() {
@@ -1213,10 +1278,15 @@ main() {
     mostrar_cabecera
     mostrar_menu
     opcion=""
-    read -rp "Opción: " opcion || {
+    if ! leer_opcion_menu; then
       printf '\n'
       exit 0
-    }
+    fi
+    opcion="$MENU_OPCION"
+    # ENTER vacío o ESC: solo refrescar la ventana (sin mensajes ni pausa).
+    if [[ -z "$opcion" ]]; then
+      continue
+    fi
     case "$opcion" in
       1) accion_estado ;;
       2) accion_init ;;
