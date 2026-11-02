@@ -1,0 +1,11 @@
+# Archivos ignorados por Git (generado por admin_git.sh)
+bin/
+obj/
+.vs/
+node_modules/
+*.log
+*.tmp
+*.user
+*.suo
+.DS_Store
+Thumbs.db
