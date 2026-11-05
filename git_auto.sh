@@ -83,6 +83,15 @@ ${C_NEGRITA}Commits:${C_RESET}
   --uncommit                Deshace el último commit conservando los cambios
                             en staging (git reset --soft HEAD~1).
 
+${C_NEGRITA}Diferencias (con delta --side-by-side):${C_RESET}
+  --showdiff-local                  Muestra los cambios de todos los archivos
+                                    modificados o nuevos contra el repositorio local.
+  --showdiff-local <archivo>        Muestra los cambios de <archivo> contra el
+                                    repositorio local.
+  --showdiff-remote                 Muestra los cambios de todos los archivos
+                                    modificados o nuevos contra el remoto (upstream).
+  --showdiff-remote <archivo>       Muestra los cambios de <archivo> contra el remoto.
+
 ${C_NEGRITA}Prompt con rama y cambios:${C_RESET}
   El script no puede cambiar el prompt de la shell padre si se ejecuta.
   Para activarlo en la sesión actual use:
@@ -95,6 +104,10 @@ ${C_NEGRITA}Ejemplos:${C_RESET}
   ${nombre} --commit "feat: nueva función"
   ${nombre} --commit                    # mensaje = fecha/hora
   ${nombre} --log 5
+  ${nombre} --showdiff-local
+  ${nombre} --showdiff-local README.md
+  ${nombre} --showdiff-remote
+  ${nombre} --showdiff-remote README.md
   ${nombre} --amend "mensaje corregido"
   ${nombre} --uncommit
 AYUDA
@@ -302,6 +315,121 @@ ver_log() {
 
 status_completo() { requerir_repo; git status; }
 
+# ---------- Diferencias (delta --side-by-side) ----------
+requerir_delta() {
+  if ! command -v delta >/dev/null 2>&1; then
+    error "No se encontró el comando 'delta'."
+    error "Instálelo desde https://github.com/dandavison/delta e inténtelo de nuevo."
+    return 1
+  fi
+}
+
+# Referencia local de comparación: HEAD o, si aún no hay commits, el árbol vacío.
+_rev_local() {
+  if git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    printf 'HEAD'
+  else
+    git hash-object -t tree /dev/null
+  fi
+}
+
+# Lista de archivos modificados, preparados o nuevos (sin duplicados).
+archivos_para_diff() {
+  {
+    git diff --name-only "$1"
+    git ls-files --others --exclude-standard
+  } | awk 'NF && !visto[$0]++'
+}
+
+# Muestra el diff de un archivo contra la referencia indicada.
+_diff_archivo() {
+  local base="$1" archivo="$2" salida
+
+  if git cat-file -e "${base}:${archivo}" 2>/dev/null; then
+    salida="$(git --no-pager diff "$base" -- "$archivo")"
+  else
+    # El archivo no existe en la referencia: se muestra completo como nuevo.
+    salida="$(git --no-pager diff --no-index -- /dev/null "$archivo" || true)"
+  fi
+
+  if [[ -z "${salida//[[:space:]]/}" ]]; then
+    info "Sin diferencias en: ${archivo}"
+    return 0
+  fi
+
+  info "Diferencias en: ${archivo}"
+  printf '%s\n' "$salida" | delta --side-by-side
+}
+
+# Recorre todos los archivos cambiados y muestra su diff contra la referencia.
+_diff_todos() {
+  local base="$1" f
+  local -a archivos=()
+
+  mapfile -t archivos < <(archivos_para_diff "$base")
+  if [[ ${#archivos[@]} -eq 0 ]]; then
+    info "No hay archivos modificados o nuevos."
+    return 0
+  fi
+
+  for f in "${archivos[@]}"; do
+    _diff_archivo "$base" "$f"
+  done
+}
+
+showdiff_local() {
+  requerir_repo
+  requerir_delta || return 1
+
+  local base archivo="${1:-}"
+  base="$(_rev_local)"
+
+  if [[ -z "$archivo" ]]; then
+    _diff_todos "$base"
+    return 0
+  fi
+
+  if [[ ! -e "$archivo" ]] && ! git cat-file -e "${base}:${archivo}" 2>/dev/null; then
+    error "El archivo '$archivo' no existe en el disco ni en el repositorio local."
+    return 1
+  fi
+
+  _diff_archivo "$base" "$archivo"
+}
+
+showdiff_remote() {
+  requerir_repo
+  requerir_delta || return 1
+
+  if ! tiene_upstream; then
+    error "La rama '$(rama_actual)' no tiene remoto (upstream) configurado."
+    error "Configúrelo con: $(basename "$0") --push"
+    return 1
+  fi
+
+  local upstream remoto archivo="${1:-}"
+  upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  remoto="${upstream%%/*}"
+
+  info "Actualizando referencias del remoto '${remoto}' (git fetch)..."
+  if ! git fetch "$remoto"; then
+    error "No se pudo actualizar el remoto '${remoto}'."
+    return 1
+  fi
+
+  if [[ -z "$archivo" ]]; then
+    _diff_todos "$upstream"
+    return 0
+  fi
+
+  if [[ ! -e "$archivo" ]] && ! git cat-file -e "${upstream}:${archivo}" 2>/dev/null; then
+    error "El archivo '$archivo' no existe en el disco ni en '${upstream}'."
+    return 1
+  fi
+
+  _diff_archivo "$upstream" "$archivo"
+}
+
 # ---------- Prompt ----------
 actualizar_prompt() {
   if es_repo; then
@@ -368,6 +496,8 @@ case "${1:-}" in
   --remote)    shift; comando_remoto "$@" ;;
   --log)       shift; ver_log "${1:-10}" ;;
   --status)    status_completo ;;
+  --showdiff-local)  shift; showdiff_local "${1:-}" ;;
+  --showdiff-remote) shift; showdiff_remote "${1:-}" ;;
   *)
     error "Opción no válida: $1"
     mostrar_ayuda
