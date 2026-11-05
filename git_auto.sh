@@ -85,6 +85,70 @@ contar_divergencia() {
   printf '%s %s' "${atras:-0}" "${adelante:-0}"
 }
 
+# Remoto principal: "origin" si existe; si no, el primero configurado.
+remoto_principal() {
+  local remotos
+  remotos="$(git remote 2>/dev/null)"
+  [[ -z "$remotos" ]] && return 1
+  if grep -qx 'origin' <<< "$remotos"; then
+    printf 'origin'
+  else
+    head -n 1 <<< "$remotos"
+  fi
+}
+
+# Configura el upstream de la rama actual a partir de <remoto>/<rama> si esa
+# rama existe en el remoto. Devuelve 1 si no se puede configurar.
+configurar_upstream() {
+  local remoto="$1" rama candidato
+  rama="$(rama_actual)"
+  candidato="${remoto}/${rama}"
+
+  git show-ref --verify --quiet "refs/remotes/${candidato}" || return 1
+  git branch --set-upstream-to="$candidato" "$rama" >/dev/null 2>&1 || return 1
+
+  ok "Upstream configurado: ${candidato}"
+}
+
+# Asegura que la rama actual tenga upstream. Si no lo tiene, actualiza el
+# remoto principal y lo vincula a <remoto>/<rama>.
+asegurar_upstream() {
+  local remoto
+
+  if tiene_upstream; then
+    return 0
+  fi
+
+  if [[ -z "$(git remote 2>/dev/null)" ]]; then
+    error "No hay ningún remoto configurado. Use: $(basename "$0") --remote add <url>"
+    return 1
+  fi
+
+  if ! remoto="$(remoto_principal)"; then
+    error "No se pudo determinar el remoto principal."
+    return 1
+  fi
+
+  info "Actualizando referencias del remoto '${remoto}' (git fetch)..."
+  if ! git fetch "$remoto"; then
+    error "No se pudo actualizar el remoto '${remoto}'."
+    return 1
+  fi
+
+  if ! configurar_upstream "$remoto"; then
+    error "La rama '$(rama_actual)' no tiene upstream y '${remoto}' no tiene esa rama."
+    error "Publique la rama con: $(basename "$0") --push"
+    return 1
+  fi
+
+  return 0
+}
+
+# ¿La referencia indicada y HEAD no comparten ningún ancestro?
+sin_ancestro_comun() {
+  ! git merge-base "$1" HEAD >/dev/null 2>&1
+}
+
 # ---------- Ayuda ----------
 mostrar_ayuda() {
   local nombre; nombre="$(basename "$0")"
@@ -387,18 +451,23 @@ pull() {
     esac
   done
 
+  local upstream atras adelante recien_actualizado=0
+
   if ! tiene_upstream; then
-    error "La rama '$(rama_actual)' no tiene remoto (upstream) configurado."
-    error "Configúrelo ejecutando: $(basename "$0") --push"
-    return 1
+    # Sin upstream: se intenta vincular a <remoto>/<rama> automáticamente.
+    if ! asegurar_upstream; then
+      return 1
+    fi
+    recien_actualizado=1
   fi
 
-  local upstream atras adelante
   upstream="$(upstream_actual)"
 
-  if ! actualizar_remoto "$upstream"; then
-    error "No se pudo actualizar el remoto de '${upstream}'."
-    return 1
+  if (( recien_actualizado == 0 )); then
+    if ! actualizar_remoto "$upstream"; then
+      error "No se pudo actualizar el remoto de '${upstream}'."
+      return 1
+    fi
   fi
 
   read -r atras adelante < <(contar_divergencia "$upstream")
@@ -432,25 +501,59 @@ pull() {
       git pull --rebase && ok "Cambios integrados con rebase."
       ;;
     merge)
-      info "Integrando con merge (git pull --no-rebase)..."
-      git pull --no-rebase --no-edit && ok "Cambios integrados con merge."
+      if sin_ancestro_comun "$upstream"; then
+        info "Las historias no comparten ancestro; se integran con --allow-unrelated-histories."
+        git pull --no-rebase --no-edit --allow-unrelated-histories && ok "Cambios integrados con merge."
+      else
+        info "Integrando con merge (git pull --no-rebase)..."
+        git pull --no-rebase --no-edit && ok "Cambios integrados con merge."
+      fi
       ;;
   esac
 }
 
 push() {
   requerir_repo
+  local rama remoto upstream atras adelante
+
   if [[ -z "$(git remote 2>/dev/null)" ]]; then
     error "No hay ningún remoto configurado. Use: $(basename "$0") --remote add <url>"
     return 1
   fi
 
+  rama="$(rama_actual)"
+  remoto="$(remoto_principal)" || {
+    error "No se pudo determinar el remoto principal."
+    return 1
+  }
+
+  # Sin upstream: se comprueba si la rama ya existe en el remoto antes de
+  # publicarla, para no chocar con commits remotos (non-fast-forward).
   if ! tiene_upstream; then
-    git push -u origin "$(rama_actual)"
+    info "Actualizando referencias del remoto '${remoto}' (git fetch)..."
+    if ! git fetch "$remoto"; then
+      error "No se pudo actualizar el remoto '${remoto}'."
+      return 1
+    fi
+
+    if git show-ref --verify --quiet "refs/remotes/${remoto}/${rama}"; then
+      upstream="${remoto}/${rama}"
+      read -r atras adelante < <(contar_divergencia "$upstream")
+
+      if [[ "$atras" -gt 0 ]]; then
+        warn "El remoto '${upstream}' tiene ${atras} commit(s) que no tienes localmente."
+        if [[ "$adelante" -gt 0 ]]; then
+          warn "Las ramas han divergido (${adelante} commit(s) solo en local)."
+        fi
+        error "Ejecute $(basename "$0") --pull para integrar los cambios antes de enviar."
+        return 1
+      fi
+    fi
+
+    git push -u "$remoto" "$rama"
     return
   fi
 
-  local upstream atras adelante
   upstream="$(upstream_actual)"
 
   if ! actualizar_remoto "$upstream"; then
