@@ -42,6 +42,13 @@ confirmar() {
   [[ -z "$respuesta" || "$respuesta" =~ ^[SsYy]$ ]]
 }
 
+# Confirmación para acciones destructivas (por defecto NO).
+confirmar_riesgo() {
+  local respuesta=""
+  read -rp "$1 [s/N]: " respuesta || true
+  [[ "$respuesta" =~ ^[SsYy]$ ]]
+}
+
 confirmar_texto() {
   local esperado="$1"
   local pregunta="$2"
@@ -134,6 +141,16 @@ hay_cambios() {
   [[ -n "$(git status --porcelain 2>/dev/null)" ]]
 }
 
+# Requisito para push/pull: no debe haber cambios sin commit.
+verificar_sin_cambios() {
+  if hay_cambios; then
+    warn "Hay cambios sin commit en su copia local. Confirme los cambios (opción 3) antes de continuar."
+    git status --short
+    return 1
+  fi
+  return 0
+}
+
 rama_actual() {
   local rama=""
   local sha=""
@@ -164,6 +181,194 @@ pedir_remoto() {
   local remoto=""
   read -rp "Nombre del remoto [$REMOTO_POR_DEFECTO]: " remoto || true
   printf '%s' "${remoto:-$REMOTO_POR_DEFECTO}"
+}
+
+# Devuelve la URL configurada para el remoto indicado (vacío si no existe).
+url_remoto() {
+  git remote get-url "${1:-}" 2>/dev/null || true
+}
+
+# Indica si el remoto usa HTTP/HTTPS (donde Git exige token, no contraseña).
+remoto_https() {
+  local url=""
+  url="$(url_remoto "${1:-}")"
+  [[ "$url" == http://* || "$url" == https://* ]]
+}
+
+# Avisa de que por HTTP/HTTPS Git no acepta contraseñas y explica cómo
+# generar el token de acceso personal (PAT) que debe usarse en su lugar.
+aviso_token_https() {
+  local remoto="${1:-}"
+  local url=""
+  url="$(url_remoto "$remoto")"
+  warn "El remoto '$remoto' usa HTTPS ($url)."
+  warn "Git no acepta contraseñas por HTTPS: debe usar un token de acceso personal (PAT)."
+  info "Cuando aparezca 'Password for $url', pegue el TOKEN (no la contraseña de la cuenta)."
+  info "Generar el token en GitHub:"
+  info "  1) Abra https://github.com/settings/tokens/new"
+  info "  2) Nombre descriptivo, caducidad y marque el permiso 'repo'."
+  info "  3) Pulse 'Generate token' y copie el valor (solo se muestra una vez)."
+  info "Generar el token en GitLab:"
+  info "  1) Abra https://gitlab.com/-/user_settings/personal_access_tokens"
+  info "  2) Nombre, caducidad y marque el permiso 'write_repository'."
+  info "  3) Pulse 'Create personal access token' y copie el valor."
+  info "Si Git ya guardó una credencial errónea, bórrela con:"
+  info "  printf 'protocol=https\\nhost=github.com\\n\\n' | git credential reject"
+  info "Alternativa sin tokens: usar SSH (git@github.com:usuario/repo.git) en la opción 4 -> 5."
+}
+
+# Crea un script auxiliar GIT_ASKPASS que muestra el aviso de Git pero pide
+# un TOKEN en lugar de una contraseña. Imprime la ruta creada.
+crear_askpass_token() {
+  local ruta=""
+  ruta="$(mktemp "${TMPDIR:-/tmp}/git_admin_askpass.XXXXXX")" || return 1
+  cat > "$ruta" <<'ASKPASS'
+#!/usr/bin/env bash
+# GIT_ASKPASS: reescribe el aviso de Git para pedir un TOKEN (no una contraseña)
+# y lee la respuesta del terminal. Git usa la salida estándar como credencial.
+prompt="${1:-}"
+case "$prompt" in
+  *Password*) prompt="${prompt/Password/Token}" ;;
+  *password*) prompt="${prompt/password/token}" ;;
+esac
+printf '%s ' "$prompt" >&2
+IFS= read -rs respuesta </dev/tty || exit 1
+printf '\n' >&2
+printf '%s\n' "$respuesta"
+ASKPASS
+  chmod 700 "$ruta" 2>/dev/null || true
+  printf '%s' "$ruta"
+}
+
+# Ejecuta 'git <argumentos...>' para el remoto indicado. Si el remoto usa
+# HTTP/HTTPS y hay terminal, la petición de contraseña se convierte en una
+# petición de token (PAT). Si no, se ejecuta Git tal cual.
+git_remoto() {
+  local remoto="${1:-}"
+  local askpass=""
+  local resultado=0
+  shift || true
+
+  if ! remoto_https "$remoto" || [[ ! -t 0 ]]; then
+    git "$@"
+    return
+  fi
+
+  if ! askpass="$(crear_askpass_token)"; then
+    git "$@"
+    return
+  fi
+
+  GIT_ASKPASS="$askpass" git "$@"
+  resultado=$?
+  rm -f "$askpass"
+  return "$resultado"
+}
+
+# Imprime 'refs/remotes/<remoto>/<rama>' si esa referencia remota existe.
+ref_remota() {
+  local remoto="${1:-}"
+  local rama="${2:-}"
+  local ref="refs/remotes/$remoto/$rama"
+  git show-ref --verify --quiet "$ref" && printf '%s' "$ref"
+}
+
+# Indica si HEAD y la referencia indicada no comparten ningún commit ancestro
+# (el caso típico de un repositorio recién creado en GitHub con README).
+historias_no_relacionadas() {
+  local ref="${1:-}"
+  [[ -n "$ref" ]] || return 1
+  git merge-base HEAD "$ref" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+# Lista los archivos que difieren entre HEAD y la referencia remota indicada.
+listar_diferencias() {
+  local ref="${1:-}"
+  local etiqueta="${2:-$ref}"
+  local linea=""
+  local estado=""
+  local ruta=""
+  local -a lineas=()
+  mapfile -t lineas < <(git diff --name-status HEAD "$ref" 2>/dev/null)
+  if [[ ${#lineas[@]} -eq 0 ]]; then
+    info "Su copia local y '$etiqueta' tienen el mismo contenido."
+    return 0
+  fi
+  printf 'Archivos que difieren entre su copia local y %s:\n' "$etiqueta"
+  for linea in "${lineas[@]}"; do
+    [[ -n "$linea" ]] || continue
+    estado="${linea%%$'\t'*}"
+    ruta="${linea#*$'\t'}"
+    case "$estado" in
+      A*) printf '  [solo en el remoto]     %s\n' "$ruta" ;;
+      D*) printf '  [solo en su copia]      %s\n' "$ruta" ;;
+      M*) printf '  [distinto en ambos]     %s\n' "$ruta" ;;
+      R*) printf '  [renombrado]            %s\n' "${ruta//$'\t'/ -> }" ;;
+      *)  printf '  [%s] %s\n' "$estado" "$ruta" ;;
+    esac
+  done
+  printf '\n'
+}
+
+# Ofrece ver lado a lado (o en formato unificado) los archivos que difieren
+# entre HEAD y la referencia remota indicada.
+ver_diferencias_remotas() {
+  local ref="${1:-}"
+  local etiqueta="${2:-$ref}"
+  local opcion=""
+  local ruta=""
+  local tmpdir=""
+  local -a rutas=()
+  mapfile -t rutas < <(git diff --name-only HEAD "$ref" 2>/dev/null)
+  if [[ ${#rutas[@]} -eq 0 ]]; then
+    return 0
+  fi
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/git_admin_diff.XXXXXX")" || return 0
+  while :; do
+    printf 'Ver diferencias con %s:\n' "$etiqueta"
+    printf '  1) Lado a lado (side-by-side)\n'
+    printf '  2) Formato unificado (patch)\n'
+    printf '  0) Continuar\n'
+    read -rp "Opción [0]: " opcion || true
+    case "${opcion:-0}" in
+      1)
+        for ruta in "${rutas[@]}"; do
+          printf '\n=== %s ===\n' "$ruta"
+          printf 'izquierda: su copia local   |   derecha: %s\n' "$etiqueta"
+          if tiene_delta; then
+            # Mismo formato que las opciones de diff del script (ver_diff/ver_show).
+            git --no-pager diff --no-color HEAD "$ref" -- "$ruta" | delta --side-by-side || true
+          else
+            git show "HEAD:$ruta" > "$tmpdir/local" 2>/dev/null || : > "$tmpdir/local"
+            git show "$ref:$ruta" > "$tmpdir/remoto" 2>/dev/null || : > "$tmpdir/remoto"
+            diff -y -t --suppress-common-lines -W "${COLUMNS:-160}" \
+              "$tmpdir/local" "$tmpdir/remoto" || true
+          fi
+        done
+        ;;
+      2)
+        git --no-pager diff --no-color "HEAD" "$ref" -- "${rutas[@]}"
+        ;;
+      0|"") break ;;
+      *) warn "Opción no válida." ;;
+    esac
+  done
+  rm -rf "$tmpdir"
+  printf '\n'
+}
+
+# Ofrece fijar '<remoto>/<rama>' como upstream de la rama actual si no lo tiene.
+asegurar_upstream() {
+  local remoto="${1:-}"
+  local rama="${2:-}"
+  [[ -n "$remoto" && -n "$rama" ]] || return 0
+  [[ -z "$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)" ]] || return 0
+  if confirmar "¿Establecer '$remoto/$rama' como upstream de '$rama'?"; then
+    if git branch --set-upstream-to="$remoto/$rama" "$rama" >/dev/null 2>&1; then
+      ok "Upstream configurado."
+    fi
+  fi
 }
 
 identidad_ok() {
@@ -451,6 +656,40 @@ accion_commit() {
   fi
 }
 
+# Indica si una URL (o ruta) de remoto es válida para Git.
+# Acepta:
+#   - HTTPS/HTTP : https://host/ruta  |  http://host/ruta
+#   - SSH (URL)  : ssh://[usuario@]host[:puerto]/ruta
+#   - SSH (scp)  : usuario@host:ruta  (p. ej. git@github.com:usuario/repo.git)
+#   - Ruta local : /ruta/al/repo, ./repo, ../repo, ~/repo (debe existir)
+url_valida() {
+  local url="${1:-}"
+  local ruta=""
+  local re_http='^https?://[^/]+/.+$'
+  local re_ssh='^ssh://([^@/]+@)?[^:/]+(:[0-9]+)?/.+$'
+  local re_scp='^[A-Za-z0-9._%+-]+@[A-Za-z0-9._-]+:.+$'
+
+  # Vacías o con espacios en blanco: no son válidas.
+  [[ -n "$url" && "$url" != *[[:space:]]* ]] || return 1
+
+  [[ "$url" =~ $re_http ]] && return 0
+  [[ "$url" =~ $re_ssh ]] && return 0
+  [[ "$url" =~ $re_scp ]] && return 0
+
+  # Ruta local: se expande '~' y se comprueba que exista en el disco.
+  ruta="${url/#\~/$HOME}"
+  [[ -e "$ruta" ]]
+}
+
+# Muestra los formatos de URL admitidos para un remoto.
+aviso_url_invalida() {
+  warn "URL no válida: '$1'"
+  info "Formatos aceptados:"
+  info "  HTTPS/HTTP : https://host/repo  |  http://host/repo"
+  info "  SSH        : ssh://usuario@host/repo  |  git@host:usuario/repo.git"
+  info "  Ruta local : /ruta/al/repo, ./repo, ../repo, ~/repo (debe existir)"
+}
+
 ver_remotos() {
   if [[ -z "$(git remote)" ]]; then
     info "No hay remotos configurados."
@@ -463,9 +702,13 @@ remoto_manual() {
   local remoto=""
   local url=""
   remoto="$(pedir_remoto)"
-  read -rp "URL del repositorio (HTTPS o SSH): " url || true
+  read -rp "URL del repositorio (HTTPS, SSH o ruta local): " url || true
   if [[ -z "$url" ]]; then
     warn "La URL está vacía."
+    return
+  fi
+  if ! url_valida "$url"; then
+    aviso_url_invalida "$url"
     return
   fi
   if git remote get-url "$remoto" >/dev/null 2>&1; then
@@ -500,9 +743,13 @@ cambiar_url_remoto() {
     warn "Remoto inválido."
     return
   fi
-  read -rp "Nueva URL: " url || true
+  read -rp "Nueva URL (HTTPS, SSH o ruta local): " url || true
   if [[ -z "$url" ]]; then
     warn "La URL está vacía."
+    return
+  fi
+  if ! url_valida "$url"; then
+    aviso_url_invalida "$url"
     return
   fi
   if git remote set-url "$remoto" "$url"; then
@@ -682,11 +929,11 @@ accion_integrar() {
 
 accion_push() {
   if ! exigir_repo; then return; fi
+  if ! verificar_sin_cambios; then return; fi
   local remoto=""
   local rama=""
   local upstream=""
-  local forzar=""
-  local respuesta=""
+  local ref=""
   remoto="$(remoto_efectivo)" || {
     warn "No hay remoto configurado."
     if confirmar "¿Configurarlo ahora?"; then
@@ -703,30 +950,73 @@ accion_push() {
     warn "Aún no hay commits para subir."
     return
   fi
+  if remoto_https "$remoto"; then
+    aviso_token_https "$remoto"
+  fi
   upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
-  read -rp "¿Usar push forzado seguro (--force-with-lease)? [s/N]: " respuesta || true
-  if [[ "$respuesta" =~ ^[SsYy]$ ]]; then
-    forzar="--force-with-lease"
+  info "Política del script: al hacer PUSH su código LOCAL tiene prioridad y NO se borran archivos del remoto."
+  # Estado real del remoto: si tiene commits que no están en local se integran
+  # antes de subir, para no perder los archivos que solo existen allí.
+  git_remoto "$remoto" fetch "$remoto" --prune || true
+  ref="$(ref_remota "$remoto" "$rama")"
+  if [[ -n "$ref" ]] && ! git merge-base --is-ancestor "$ref" HEAD 2>/dev/null; then
+    warn "El remoto '$remoto/$rama' tiene commits que su copia local no tiene."
+    listar_diferencias "$ref" "$remoto/$rama"
+    ver_diferencias_remotas "$ref" "$remoto/$rama"
+    info "La integración conserva los archivos de ambos lados; su versión local gana en los conflictos."
+    if ! confirmar_riesgo "¿Integrar el remoto y luego subir?"; then
+      warn "Push cancelado. El remoto no se modificó."
+      return
+    fi
+    if ! identidad_ok; then
+      warn "Falta su identidad de Git (opción 15) para crear el commit de integración."
+      return
+    fi
+    if git_remoto "$remoto" merge --no-edit --allow-unrelated-histories -X ours "$ref"; then
+      ok "Remoto integrado: se conservaron sus archivos y su versión local ganó en los conflictos."
+    else
+      warn "No se pudo integrar automáticamente. Revise 'git status', resuelva los conflictos y reintente."
+      warn "Para deshacer la integración: git merge --abort"
+      return
+    fi
   fi
   local -a args=(push)
-  if [[ -n "$forzar" ]]; then
-    args+=("$forzar")
-  fi
   if [[ -z "$upstream" ]]; then
     if ! confirmar "La rama '$rama' no tiene upstream. ¿Subirla a '$remoto/$rama'?"; then return; fi
     args+=(-u "$remoto" "$rama")
   else
     args+=("$remoto" "$rama")
   fi
-  if git "${args[@]}"; then
+  if git_remoto "$remoto" "${args[@]}"; then
     ok "Push completado."
+    return
+  fi
+  # Último recurso: reescribir la rama remota (esto SÍ elimina archivos del remoto).
+  warn "Git rechazó el push."
+  info "Forzar el push reescribe la rama remota y ELIMINA los archivos que solo existen en el remoto."
+  if ! confirmar_riesgo "¿Forzar el push de todos modos (--force-with-lease)?"; then
+    warn "Push cancelado. El remoto no se modificó."
+    return
+  fi
+  # Actualiza las referencias remotas para que la 'lease' se base en datos frescos.
+  git_remoto "$remoto" fetch "$remoto" --prune || true
+  local -a args_forzado=(push --force-with-lease)
+  if [[ -z "$upstream" ]]; then
+    args_forzado+=(-u "$remoto" "$rama")
   else
-    warn "El push no se completó. Revise el estado o haga Pull primero."
+    args_forzado+=("$remoto" "$rama")
+  fi
+  if git_remoto "$remoto" "${args_forzado[@]}"; then
+    ok "Push forzado completado: el remoto quedó igual que su copia local."
+    warn "Los archivos que solo existían en el remoto se perdieron en la rama remota."
+  else
+    warn "El push forzado no se completó. Revise sus credenciales o permisos."
   fi
 }
 
 accion_pull() {
   if ! exigir_repo; then return; fi
+  if ! verificar_sin_cambios; then return; fi
   local remoto=""
   local rama=""
   local estrategia=""
@@ -740,16 +1030,10 @@ accion_pull() {
     warn "No está en una rama (HEAD desacoplado)."
     return
   fi
-  if hay_cambios; then
-    warn "Hay cambios locales sin confirmar."
-    if confirmar "¿Guardarlos en stash antes del pull?"; then
-      accion_stash_guardar
-      info "Recuerde recuperar sus cambios con la opción 13 (stash)."
-    else
-      if ! confirmar "¿Continuar con el pull de todos modos?"; then return; fi
-    fi
+  if remoto_https "$remoto"; then
+    aviso_token_https "$remoto"
   fi
-  if ! git fetch "$remoto" --prune; then
+  if ! git_remoto "$remoto" fetch "$remoto" --prune; then
     error "No se pudo consultar el remoto."
     return
   fi
@@ -757,32 +1041,60 @@ accion_pull() {
     warn "La rama '$remoto/$rama' no existe. Haga push primero."
     return
   fi
-  printf 'Estrategia de pull:\n'
-  printf '  1) Solo fast-forward (recomendado)\n'
-  printf '  2) Rebase\n'
-  printf '  3) Merge\n'
+  local ref=""
+  local -a opciones_merge=()
+  ref="$(ref_remota "$remoto" "$rama")"
+  if historias_no_relacionadas "$ref"; then
+    opciones_merge+=(--allow-unrelated-histories)
+    warn "La rama local '$rama' y '$remoto/$rama' no comparten historia (historias no relacionadas)."
+    info "Suele ocurrir cuando el repositorio remoto se creó con README y su copia local tiene otro historial."
+    info "Se fusionarán ambas historias conservando los archivos de los dos lados."
+  fi
+  info "Política del script: al hacer PULL el código REMOTO tiene prioridad y NO se borran archivos locales."
+  printf 'Estrategia de pull (sin borrar archivos):\n'
+  printf '  1) Fusionar (conserva archivos de ambos lados; el remoto gana en conflictos) [recomendado]\n'
+  printf '  2) Rebase (sus commits locales se reaplican sobre el remoto)\n'
+  printf '  3) Solo fast-forward (falla si las ramas divergen)\n'
   read -rp "Opción [1]: " estrategia || true
   case "${estrategia:-1}" in
-    1) git pull --ff-only "$remoto" "$rama"; resultado=$? ;;
-    2) git pull --rebase "$remoto" "$rama"; resultado=$? ;;
-    3) git pull --no-rebase "$remoto" "$rama"; resultado=$? ;;
+    1)
+      if [[ -n "$ref" ]] && ! git merge-base --is-ancestor HEAD "$ref" 2>/dev/null; then
+        listar_diferencias "$ref" "$remoto/$rama"
+        ver_diferencias_remotas "$ref" "$remoto/$rama"
+        info "La fusión conserva los archivos de ambos lados; el remoto gana en los conflictos."
+        if ! confirmar_riesgo "¿Fusionar '$remoto/$rama' en '$rama'?"; then
+          warn "Pull cancelado. No se modificó su repositorio local."
+          return
+        fi
+      fi
+      if ! identidad_ok; then
+        warn "Falta su identidad de Git (opción 15) para crear el commit de fusión."
+        return
+      fi
+      if git_remoto "$remoto" pull --no-rebase -X theirs "${opciones_merge[@]}" "$remoto" "$rama"; then
+        resultado=0
+      else
+        resultado=1
+      fi
+      ;;
+    2) git_remoto "$remoto" pull --rebase "$remoto" "$rama"; resultado=$? ;;
+    3) git_remoto "$remoto" pull --ff-only "$remoto" "$rama"; resultado=$? ;;
     *)
       warn "Opción no válida."
       return
       ;;
   esac
   if [[ $resultado -ne 0 ]]; then
-    warn "El pull no se completó. Revise conflictos o el estado del repositorio."
+    warn "El pull no se completó. Revise 'git status' y resuelva los conflictos."
+    if [[ "${estrategia:-1}" == "2" ]]; then
+      warn "Para deshacer el rebase: git rebase --abort"
+    else
+      warn "Para deshacer la fusión: git merge --abort"
+    fi
     return
   fi
-  ok "Pull completado."
-  if [[ -z "$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)" ]]; then
-    if confirmar "¿Establecer '$remoto/$rama' como upstream de '$rama'?"; then
-      if git branch --set-upstream-to="$remoto/$rama" "$rama" >/dev/null; then
-        ok "Upstream configurado."
-      fi
-    fi
-  fi
+  ok "Pull completado. Se conservaron los archivos propios de cada lado."
+  asegurar_upstream "$remoto" "$rama"
 }
 
 comparar_ramas() {
@@ -987,11 +1299,15 @@ accion_fusionar() {
 
 accion_fetch() {
   if ! exigir_repo; then return; fi
-  if ! remoto_efectivo >/dev/null; then
+  local remoto=""
+  remoto="$(remoto_efectivo)" || {
     warn "No hay remoto configurado."
     return
+  }
+  if remoto_https "$remoto"; then
+    aviso_token_https "$remoto"
   fi
-  if git fetch --all --prune; then
+  if git_remoto "$remoto" fetch --all --prune; then
     ok "Referencias remotas actualizadas."
   else
     error "No se pudieron actualizar las referencias remotas."
