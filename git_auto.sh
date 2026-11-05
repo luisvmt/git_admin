@@ -115,7 +115,8 @@ ${C_NEGRITA}Repositorio remoto:${C_RESET}
                                    ejecutar --pull antes de enviar.
 
 ${C_NEGRITA}Commits:${C_RESET}
-  --init                    Inicializa un repositorio git (rama main) si no existe.
+  --init                    Inicializa un repositorio git (rama main) y crea
+                            los archivos de plantilla que falten.
   --commit [mensaje]        Añade todos los cambios y hace commit con el mensaje.
                             Sin mensaje: usa la fecha y hora actual
                             (formato %Y-%m-%d %H:%M:%S).
@@ -188,10 +189,94 @@ resumen() {
 }
 
 # ---------- Init ----------
+# Carpeta donde está el propio script (resuelve enlaces simbólicos).
+_directorio_script() {
+  local origen="${BASH_SOURCE[0]}" real
+  real="$(readlink -f "$origen" 2>/dev/null)" || real="$origen"
+  printf '%s' "$(dirname "$real")"
+}
+
+# Copia las plantillas que estén junto al script. Nunca sobrescribe archivos
+# existentes: solo crea los que faltan.
+_copiar_plantillas() {
+  local plantillas archivo origen destino
+  local creados=0 existentes=0 faltantes=0
+
+  plantillas="$(_directorio_script)/plantillas"
+  if [[ ! -d "$plantillas" ]]; then
+    warn "No se encontró la carpeta de plantillas: ${plantillas}"
+    return 1
+  fi
+
+  local -a archivos=(
+    ".clineignore"
+    ".clinerules"
+    ".gitattributes"
+    ".gitignore"
+    "AGENTS.md"
+    "opencode.json"
+    ".secrets/litellm_api_key"
+    "custom_scripts/excluir_archivos.sh"
+    "custom_scripts/listar_archivos_por_excluir.sh"
+  )
+
+  for archivo in "${archivos[@]}"; do
+    origen="$plantillas/$archivo"
+    destino="$archivo"
+
+    if [[ ! -e "$origen" ]]; then
+      warn "Falta la plantilla: ${archivo}"
+      faltantes=$((faltantes + 1))
+      continue
+    fi
+
+    if [[ -e "$destino" ]]; then
+      info "Ya existe, se conserva: ${archivo}"
+      existentes=$((existentes + 1))
+      continue
+    fi
+
+    if ! mkdir -p "$(dirname "$destino")"; then
+      error "No se pudo crear la carpeta de: ${archivo}"
+      continue
+    fi
+
+    if ! cp -p "$origen" "$destino"; then
+      error "No se pudo crear: ${archivo}"
+      continue
+    fi
+
+    case "$archivo" in
+      .secrets/*)
+        chmod 700 .secrets 2>/dev/null
+        chmod 600 "$destino" 2>/dev/null
+        ;;
+      *.sh)
+        chmod +x "$destino" 2>/dev/null
+        ;;
+    esac
+
+    ok "Creado: ${archivo}"
+    creados=$((creados + 1))
+  done
+
+  echo
+  info "Plantillas: ${creados} creada(s), ${existentes} conservada(s), ${faltantes} faltante(s)."
+}
+
 inicializar() {
-  if es_repo; then ok "El directorio ya es un repositorio git."; return 0; fi
-  git init -q && git symbolic-ref HEAD refs/heads/main
-  ok "Repositorio inicializado con la rama main."
+  if es_repo; then
+    ok "El directorio ya es un repositorio git."
+  else
+    if ! git init -q; then
+      error "Falló 'git init'."
+      return 1
+    fi
+    git symbolic-ref HEAD refs/heads/main
+    ok "Repositorio inicializado con la rama main."
+  fi
+
+  _copiar_plantillas
 }
 
 # ---------- Commit / Amend / Uncommit ----------

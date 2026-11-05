@@ -1,0 +1,137 @@
+# Archivos ignorados por Git
+bin/
+obj/
+.vs/
+*.tmp
+*.user
+*.suo
+
+# Dependencias
+node_modules/
+venv/
+.venv/
+__pycache__/
+target/
+
+# python
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# node.js
+.npm/
+.pnpm-store/
+.yarn/
+.yarn-error.log
+pnpm-debug.log*
+npm-debug.log*
+.eslintcache
+.next/
+.nuxt/
+coverage/
+
+# visual studio
+.vscode-test/
+*.sln.docstates
+*.cachefile
+*.psess
+*.vsp
+*.vspx
+
+# terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Build
+dist/
+build/
+*.o
+*.class
+
+# Secretos y entorno
+.secrets*
+/secrets/
+.env*
+!.env.example
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+credentials.json
+.envrc
+.direnv/
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Logs
+*.log
+logs/
+
+# configuracion de herramientas de desarrollo
+.vscode/
+.idea/
+
+# Sistema operativo (afecta a todos)
+[Tt]humbs.db
+desktop.ini
+.DS_Store
+**/.DS_Store
+ehthumbs.db
+*.lnk
+$RECYCLE.BIN/
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+
+# temporales
+*.bak
+*.orig
+*.rej
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+
+# comprimidos
+*.tar.gz
+*.zip
+*.tar
+
+# backups
+backup2
+backup_*
+backup-*
+
+# bases de datos
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# archivos y carpetas sensibles de modelos
+.clineignore
+.clinerules
+AGENTS.md
+opencode.json
+memory-bank/
+
+# archivos y carpetas sensibles de la aplicacion
+custom_scripts/
+implementation_plan.md
+modelos_prompt.md
+/config/
+instalador/
+!plantillas/
