@@ -19,6 +19,13 @@ else
   C_RESET=""; C_NEGRITA=""; C_CIAN=""; C_VERDE=""; C_AMARILLO=""; C_ROJO=""
 fi
 
+# ---------- Colores del prompt (configurables por variable de entorno) ----------
+# Rama en verde negrita y número de cambios en amarillo.
+C_RAMA_PROMPT="${C_RAMA_PROMPT-${C_NEGRITA}${C_VERDE}}"
+C_CAMBIOS_PROMPT="${C_CAMBIOS_PROMPT-${C_AMARILLO}}"
+# Reset para el prompt: se emite solo cuando hay colores activos.
+C_PROMPT_RESET="${C_PROMPT_RESET-$'\e[0m'}"
+
 info()  { printf '%s%s%s\n' "$C_CIAN"     "$*" "$C_RESET"; }
 ok()    { printf '%s%s%s\n' "$C_VERDE"    "$*" "$C_RESET"; }
 warn()  { printf '%s%s%s\n' "$C_AMARILLO" "$*" "$C_RESET" >&2; }
@@ -51,6 +58,33 @@ cantidad_cambios() { git status --porcelain 2>/dev/null | wc -l | tr -d ' '; }
 remoto_existe() { git remote get-url "$1" >/dev/null 2>&1; }
 tiene_upstream() { git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; }
 
+upstream_actual() {
+  git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null
+}
+
+# Nombre del remoto a partir del upstream (p. ej. "origin/main" -> "origin").
+remoto_del_upstream() {
+  local upstream="$1" remoto="${1%%/*}"
+  [[ "$remoto" == "$upstream" ]] && remoto="origin"
+  printf '%s' "$remoto"
+}
+
+# Actualiza las referencias del remoto del upstream. Devuelve 1 si falla.
+actualizar_remoto() {
+  local upstream="$1" remoto
+  remoto="$(remoto_del_upstream "$upstream")"
+  info "Actualizando referencias del remoto '${remoto}' (git fetch)..."
+  git fetch "$remoto"
+}
+
+# Compara el upstream con HEAD y devuelve "atras adelante": cuántos commits
+# hay solo en el remoto y cuántos solo en local.
+contar_divergencia() {
+  local upstream="$1" atras adelante
+  read -r atras adelante < <(git rev-list --left-right --count "${upstream}...HEAD" 2>/dev/null)
+  printf '%s %s' "${atras:-0}" "${adelante:-0}"
+}
+
 # ---------- Ayuda ----------
 mostrar_ayuda() {
   local nombre; nombre="$(basename "$0")"
@@ -59,6 +93,7 @@ ${C_NEGRITA}Uso:${C_RESET} ${nombre} [opción] [argumentos]
 
 ${C_NEGRITA}Estado y navegación:${C_RESET}
   (sin opciones)            Muestra un resumen del estado del repositorio.
+  --menu                    Menú interactivo con todas las opciones.
   -h, --help                Muestra esta ayuda.
   --status                  Muestra el estado completo (git status).
   --log [n]                 Muestra los últimos n commits (por defecto 10).
@@ -72,7 +107,12 @@ ${C_NEGRITA}Repositorio remoto:${C_RESET}
   --remote set-url <url> [nombre]  Cambia la URL del remoto indicado.
   --remote remove [nombre]         Elimina el remoto indicado.
   --pull                           Trae modificaciones del servidor remoto.
+  --pull --rebase                  Si hay divergencia, reaplica los commits
+                                   locales sobre los del remoto.
+  --pull --merge                   Si hay divergencia, crea un commit de fusión.
   --push                           Envía modificaciones al servidor remoto.
+                                   Si el remoto tiene commits nuevos, indica
+                                   ejecutar --pull antes de enviar.
 
 ${C_NEGRITA}Commits:${C_RESET}
   --init                    Inicializa un repositorio git (rama main) si no existe.
@@ -93,6 +133,8 @@ ${C_NEGRITA}Diferencias (con delta --side-by-side):${C_RESET}
   --showdiff-remote <archivo>       Muestra los cambios de <archivo> contra el remoto.
 
 ${C_NEGRITA}Prompt con rama y cambios:${C_RESET}
+  El prompt muestra [rama] (cambios): la rama en verde negrita y el número
+  de cambios sin commit en amarillo.
   El script no puede cambiar el prompt de la shell padre si se ejecuta.
   Para activarlo en la sesión actual use:
     source ${nombre}
@@ -110,6 +152,10 @@ ${C_NEGRITA}Ejemplos:${C_RESET}
   ${nombre} --showdiff-remote README.md
   ${nombre} --amend "mensaje corregido"
   ${nombre} --uncommit
+  ${nombre} --pull                     # si diverge, pregunta la estrategia
+  ${nombre} --pull --rebase            # reaplicar commits locales
+  ${nombre} --pull --merge             # crear commit de fusión
+  ${nombre} --menu                     # menú interactivo
 AYUDA
 }
 
@@ -193,7 +239,119 @@ uncommit() {
 }
 
 # ---------- Pull / Push ----------
-pull() { requerir_repo; git pull; }
+# Explica las estrategias de integración cuando las ramas han divergido.
+_ayuda_estrategias() {
+  cat <<'AYUDA'
+  r) Rebase: tus commits locales se reaplican sobre los del remoto. El historial
+     queda lineal, sin commits de fusión. Reescribe tus commits locales, así que
+     no conviene si ya los compartiste con otros. Este comando usa la opción
+     --rebase en el comando git.
+  m) Merge: se crea un commit de fusión que une las dos historias. Conserva el
+     historial tal cual ocurrió. Es lo más seguro si no estás seguro. Este
+     comando usa la opción --no-rebase en el comando git.
+  c) Cancelar: no se cambia nada en el repositorio.
+AYUDA
+}
+
+# Pregunta la estrategia cuando hay divergencia. Deja el resultado en la
+# variable global ESTRATEGIA_PULL: "rebase", "merge" o "cancelar".
+_preguntar_estrategia() {
+  local atras="$1" adelante="$2" respuesta
+  ESTRATEGIA_PULL=""
+
+  if [[ ! -t 0 ]]; then
+    error "No se puede preguntar la estrategia sin terminal interactiva."
+    error "Use: $(basename "$0") --pull --rebase   o   $(basename "$0") --pull --merge"
+    return 1
+  fi
+
+  warn "Las ramas han divergido: ${adelante} commit(s) local(es) y ${atras} commit(s) remoto(s)."
+  printf '%s\n' "¿Cómo quieres integrarlas?"
+  _ayuda_estrategias
+
+  while true; do
+    if ! _leer_linea 'Opción [r/m/c] (o ? para ver la ayuda): ' respuesta; then
+      ESTRATEGIA_PULL="cancelar"
+      return 0
+    fi
+    case "${respuesta,,}" in
+      r|rebase)             ESTRATEGIA_PULL="rebase";   return 0 ;;
+      m|merge)              ESTRATEGIA_PULL="merge";    return 0 ;;
+      c|cancelar|cancel)    ESTRATEGIA_PULL="cancelar"; return 0 ;;
+      $'\e')                ESTRATEGIA_PULL="cancelar"; return 0 ;;
+      '?')                  _ayuda_estrategias ;;
+      "")                   ;;
+      *)                    warn "Opción no válida. Escriba r, m, c o ?." ;;
+    esac
+  done
+}
+
+pull() {
+  requerir_repo
+
+  local estrategia="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      --rebase)              estrategia="rebase" ;;
+      --merge|--no-rebase)   estrategia="merge" ;;
+      *)
+        error "Opción no válida para --pull: $arg"
+        error "Use: $(basename "$0") --pull [--rebase|--merge]"
+        return 1
+        ;;
+    esac
+  done
+
+  if ! tiene_upstream; then
+    error "La rama '$(rama_actual)' no tiene remoto (upstream) configurado."
+    error "Configúrelo ejecutando: $(basename "$0") --push"
+    return 1
+  fi
+
+  local upstream atras adelante
+  upstream="$(upstream_actual)"
+
+  if ! actualizar_remoto "$upstream"; then
+    error "No se pudo actualizar el remoto de '${upstream}'."
+    return 1
+  fi
+
+  read -r atras adelante < <(contar_divergencia "$upstream")
+
+  # Sin commits nuevos en el remoto: no hay nada que reconciliar.
+  if [[ "$atras" -eq 0 ]]; then
+    git pull
+    return
+  fi
+
+  # Solo el remoto tiene commits nuevos: avance rápido, no hay divergencia.
+  if [[ "$adelante" -eq 0 ]]; then
+    info "El remoto tiene ${atras} commit(s) nuevos. Integrando por avance rápido..."
+    git pull
+    return
+  fi
+
+  # Ramas divergidas: usar la estrategia indicada o preguntar.
+  if [[ -z "$estrategia" ]]; then
+    _preguntar_estrategia "$atras" "$adelante" || return 1
+    estrategia="$ESTRATEGIA_PULL"
+  fi
+
+  case "$estrategia" in
+    cancelar)
+      info "Operación cancelada. No se ha modificado el repositorio."
+      return 0
+      ;;
+    rebase)
+      info "Integrando con rebase (git pull --rebase)..."
+      git pull --rebase && ok "Cambios integrados con rebase."
+      ;;
+    merge)
+      info "Integrando con merge (git pull --no-rebase)..."
+      git pull --no-rebase --no-edit && ok "Cambios integrados con merge."
+      ;;
+  esac
+}
 
 push() {
   requerir_repo
@@ -201,7 +359,32 @@ push() {
     error "No hay ningún remoto configurado. Use: $(basename "$0") --remote add <url>"
     return 1
   fi
-  if tiene_upstream; then git push; else git push -u origin "$(rama_actual)"; fi
+
+  if ! tiene_upstream; then
+    git push -u origin "$(rama_actual)"
+    return
+  fi
+
+  local upstream atras adelante
+  upstream="$(upstream_actual)"
+
+  if ! actualizar_remoto "$upstream"; then
+    error "No se pudo actualizar el remoto de '${upstream}'."
+    return 1
+  fi
+
+  read -r atras adelante < <(contar_divergencia "$upstream")
+
+  if [[ "$atras" -gt 0 ]]; then
+    warn "El remoto '${upstream}' tiene ${atras} commit(s) que no tienes localmente."
+    if [[ "$adelante" -gt 0 ]]; then
+      warn "Las ramas han divergido (${adelante} commit(s) solo en local)."
+    fi
+    error "Ejecute $(basename "$0") --pull para integrar los cambios antes de enviar."
+    return 1
+  fi
+
+  git push
 }
 
 # ---------- Ramas ----------
@@ -313,7 +496,31 @@ ver_log() {
   git log --oneline --decorate --graph -n "$n"
 }
 
-status_completo() { requerir_repo; git status; }
+status_completo() {
+  requerir_repo
+  git status
+
+  if ! tiene_upstream; then
+    return 0
+  fi
+
+  local upstream atras adelante
+  upstream="$(upstream_actual)"
+  read -r atras adelante < <(contar_divergencia "$upstream")
+
+  if [[ "$atras" -gt 0 || "$adelante" -gt 0 ]]; then
+    echo
+    info "Resumen respecto a '${upstream}': ${adelante} commit(s) solo en local, ${atras} commit(s) solo en el remoto."
+    if [[ "$atras" -gt 0 && "$adelante" -gt 0 ]]; then
+      warn "Las ramas han divergido."
+      info "Ejecute: $(basename "$0") --pull   (le preguntará rebase, merge o cancelar)"
+    elif [[ "$atras" -gt 0 ]]; then
+      info "Ejecute: $(basename "$0") --pull   para traer los cambios del remoto"
+    else
+      info "Ejecute: $(basename "$0") --push   para enviar tus commits"
+    fi
+  fi
+}
 
 # ---------- Diferencias (delta --side-by-side) ----------
 requerir_delta() {
@@ -403,7 +610,7 @@ showdiff_remote() {
 
   if ! tiene_upstream; then
     error "La rama '$(rama_actual)' no tiene remoto (upstream) configurado."
-    error "Configúrelo con: $(basename "$0") --push"
+    error "Configúrelo ejecutando: $(basename "$0") --push"
     return 1
   fi
 
@@ -431,9 +638,23 @@ showdiff_remote() {
 }
 
 # ---------- Prompt ----------
+# Muestra: [rama] (cambios): rama en verde negrita y número de cambios en
+# amarillo. Las secuencias de color se envuelven con \001 ... \002 (marcadores
+# de "no imprimible" de readline) para que no descuadren el cursor.
+_np() { [[ -n "${1:-}" ]] && printf '\001%s\002' "$1"; return 0; }
+# Reset entre segmentos: solo si hay algún color configurado.
+_np_reset() {
+  [[ -n "${C_RAMA_PROMPT}${C_CAMBIOS_PROMPT}" ]] && printf '\001%s\002' "$C_PROMPT_RESET"
+  return 0
+}
+
 actualizar_prompt() {
+  local rama cambios res
   if es_repo; then
-    GIT_AUTO_PS1="[$(rama_actual)] ($(cantidad_cambios)) "
+    rama="$(rama_actual)"
+    cambios="$(cantidad_cambios)"
+    res="$(_np_reset)"
+    GIT_AUTO_PS1="$(_np "$C_RAMA_PROMPT")${rama}${res} $(_np "$C_CAMBIOS_PROMPT")(${cambios})${res} "
   else
     GIT_AUTO_PS1=""
   fi
@@ -451,17 +672,520 @@ _prompt_command_ya_incluye_hook() {
   fi
 }
 
+_activar_hook_prompt_array() {
+  local previas=("${PROMPT_COMMAND[@]}")
+  PROMPT_COMMAND=(actualizar_prompt "${previas[@]}")
+}
+
+_activar_hook_prompt_cadena() {
+  local previa="${PROMPT_COMMAND:-}" nuevo="actualizar_prompt"
+  [[ -n "$previa" ]] && nuevo+="; ${previa}"
+  printf -v PROMPT_COMMAND '%s' "$nuevo"
+}
+
 activar_prompt() {
   actualizar_prompt
   if ! _prompt_command_ya_incluye_hook; then
     if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
-      PROMPT_COMMAND=(actualizar_prompt "${PROMPT_COMMAND[@]}")
+      _activar_hook_prompt_array
     else
-      PROMPT_COMMAND="actualizar_prompt${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
+      _activar_hook_prompt_cadena
     fi
   fi
   PS1='\u@\h:\w ${GIT_AUTO_PS1}\$ '
   ok "Prompt de git_auto activado en esta sesión."
+}
+
+# ============================================================
+# Menú interactivo (--menu)
+# ============================================================
+# Colores del menú: selección (letra negra sobre fondo cian) y descripción.
+C_MENU_SELECCION=$'\e[1;30;46m'
+C_MENU_DESC=$'\e[35m'
+
+# Opciones del menú. Los índices de los arrays se corresponden entre sí.
+_menu_inicializar_opciones() {
+  _MENU_IDS=(       1             2                3          4            5
+                    6           7                8                 9
+                    10            11           12           13          14
+                    15            16              17               18          0 )
+  _MENU_ETIQUETAS=( resumen       status           log        ramas        "nueva rama"
+                    remotos     "anadir remoto"  "cambiar URL"     "eliminar remoto"
+                    commit        amend            uncommit   pull        push
+                    init          "diff local"     "diff remoto"     ayuda       salir )
+  _MENU_DESC=(
+    "Muestra un resumen del estado del repositorio (rama, remoto y cambios)."
+    "Muestra el estado completo del repositorio y la divergencia con el remoto."
+    "Muestra los últimos commits; puedes indicar cuántos (10 por defecto)."
+    "Lista las ramas y permite cambiar a otra."
+    "Crea una rama nueva y cambia a ella."
+    "Muestra los remotos configurados."
+    "Añade un remoto nuevo; pide la URL y el nombre (origin por defecto)."
+    "Cambia la URL de un remoto existente."
+    "Elimina un remoto existente."
+    "Añade todos los cambios y hace commit; pide el mensaje."
+    "Corrige el último commit; pide el mensaje."
+    "Deshace el último commit y conserva los cambios en staging."
+    "Trae cambios del remoto; si hay divergencia pregunta rebase, merge o cancelar."
+    "Envía tus commits al remoto; avisa si hay que hacer pull antes."
+    "Inicializa un repositorio git con la rama main en la carpeta actual."
+    "Lista los archivos modificados y muestra su diff local; se elige por número o nombre."
+    "Lista los archivos con cambios frente al remoto y muestra su diff; se elige por número o nombre."
+    "Muestra la ayuda completa del script."
+    "Sale del menú."
+  )
+  _MENU_ACCIONES=(
+    _menu_accion_resumen
+    _menu_accion_status
+    _menu_accion_log
+    _menu_accion_ramas
+    _menu_accion_nueva_rama
+    _menu_accion_mostrar_remotos
+    _menu_accion_agregar_remoto
+    _menu_accion_seturl_remoto
+    _menu_accion_eliminar_remoto
+    _menu_accion_commit
+    _menu_accion_amend
+    _menu_accion_uncommit
+    _menu_accion_pull
+    _menu_accion_push
+    _menu_accion_init
+    _menu_accion_diff_local
+    _menu_accion_diff_remote
+    _menu_accion_ayuda
+    _menu_accion_salir
+  )
+}
+
+_menu_restaurar() {
+  printf '\e[?25h'
+  trap - EXIT INT TERM
+}
+
+_menu_salir() {
+  _menu_restaurar
+  exit 0
+}
+
+# Lee una tecla y deja el resultado en _TECLA:
+# ARRIBA, ABAJO, ENTER, ESC, EOF, NUM:<dígito> u OTRO.
+_menu_leer_resto_escape() {
+  local c2 c3
+  _ESC_ARROW=""
+  IFS= read -rsn1 -t 0.05 c2 || return 1
+  [[ "$c2" == "[" || "$c2" == "O" ]] || return 1
+  IFS= read -rsn1 -t 0.05 c3 || return 1
+  case "$c3" in
+    A) _ESC_ARROW="ARRIBA" ;;
+    B) _ESC_ARROW="ABAJO" ;;
+  esac
+  return 0
+}
+
+_menu_leer_tecla() {
+  local c
+  _TECLA=""
+  if ! IFS= read -rsn1 c; then
+    _TECLA="EOF"
+    return
+  fi
+  case "$c" in
+    $'\e')
+      if _menu_leer_resto_escape; then
+        case "$_ESC_ARROW" in
+          ARRIBA) _TECLA="ARRIBA" ;;
+          ABAJO)  _TECLA="ABAJO" ;;
+          *)      _TECLA="OTRO" ;;
+        esac
+      else
+        _TECLA="ESC"
+      fi
+      ;;
+    "")    _TECLA="ENTER" ;;
+    [0-9]) _TECLA="NUM:${c}" ;;
+    *)     _TECLA="OTRO" ;;
+  esac
+}
+
+# Lee una línea con edición básica. Devuelve 1 si se pulsa ESC (cancelar).
+_leer_linea() {
+  local prompt="$1" destino="$2" texto="" tecla
+  printf '%s' "$prompt"
+  while true; do
+    if ! IFS= read -rsn1 tecla; then
+      printf '\n'
+      return 1
+    fi
+    case "$tecla" in
+      $'\e')
+        printf '\n'
+        return 1
+        ;;
+      "")
+        printf '\n'
+        [[ -n "$destino" ]] && printf -v "$destino" '%s' "$texto"
+        return 0
+        ;;
+      $'\x7f'|$'\b')
+        if [[ -n "$texto" ]]; then
+          texto="${texto%?}"
+          printf '\b \b'
+        fi
+        ;;
+      *)
+        texto+="$tecla"
+        printf '%s' "$tecla"
+        ;;
+    esac
+  done
+}
+
+_menu_hay_prefijo() {
+  local prefijo="$1" id
+  for id in "${_MENU_IDS[@]}"; do
+    [[ ${#id} -gt 1 && "${id:0:1}" == "$prefijo" ]] && return 0
+  done
+  return 1
+}
+
+_menu_indice_de_id() {
+  local id="$1" i
+  for i in "${!_MENU_IDS[@]}"; do
+    if [[ "${_MENU_IDS[$i]}" == "$id" ]]; then
+      _MENU_IDX="$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_menu_esperar_enter() {
+  while true; do
+    _menu_leer_tecla
+    case "$_TECLA" in
+      ENTER|ESC|EOF) return 0 ;;
+    esac
+  done
+}
+
+_menu_estado_rama() {
+  local rama upstream atras adelante cambios estado
+  if ! es_repo; then
+    printf 'Rama: (no es un repositorio git)'
+    return
+  fi
+  rama="$(rama_actual)"
+
+  if tiene_upstream; then
+    upstream="$(upstream_actual)"
+    read -r atras adelante < <(contar_divergencia "$upstream")
+    if [[ "$atras" -eq 0 && "$adelante" -eq 0 ]]; then
+      printf 'Rama: %s   ·   al día con %s' "$rama" "$upstream"
+    else
+      printf 'Rama: %s   ·   ↑ %s para subir   ·   ↓ %s para bajar' "$rama" "$adelante" "$atras"
+    fi
+    return
+  fi
+
+  # Sin upstream: no hay nada que subir ni bajar, pero sí cambios locales.
+  if [[ -n "$(git remote 2>/dev/null)" ]]; then
+    estado="sin upstream en '${rama}'"
+  else
+    estado="sin remoto configurado"
+  fi
+
+  cambios="$(cantidad_cambios)"
+  if [[ "$cambios" -eq 0 ]]; then
+    printf 'Rama: %s   ·   %s   ·   sin cambios pendientes' "$rama" "$estado"
+  elif [[ "$cambios" -eq 1 ]]; then
+    printf 'Rama: %s   ·   %s   ·   1 cambio sin commit' "$rama" "$estado"
+  else
+    printf 'Rama: %s   ·   %s   ·   %s cambios sin commit' "$rama" "$estado" "$cambios"
+  fi
+}
+
+_menu_dibujar() {
+  local i
+  printf '\e[H\e[2J'
+  printf '%sgit_auto - menú principal%s\n' "$C_NEGRITA" "$C_RESET"
+  printf '%s%s%s\n\n' "$C_CIAN" "$(_menu_estado_rama)" "$C_RESET"
+  for i in "${!_MENU_IDS[@]}"; do
+    if (( i == _MENU_SEL )); then
+      printf '%s  > %2s) %-22s%s\n' "$C_MENU_SELECCION" "${_MENU_IDS[$i]}" "${_MENU_ETIQUETAS[$i]}" "$C_RESET"
+    else
+      printf '    %2s) %s\n' "${_MENU_IDS[$i]}" "${_MENU_ETIQUETAS[$i]}"
+    fi
+  done
+  printf '\n  %s\n' "-------------------------------------------------------------------------"
+  printf '%s  %s%s\n' "$C_MENU_DESC" "${_MENU_DESC[$_MENU_SEL]}" "$C_RESET"
+  printf '  %s\n' "-------------------------------------------------------------------------"
+  printf '  ↑/↓ mover · ENTER ejecutar · número elige · 0/ESC salir\n'
+}
+
+_menu_ejecutar() {
+  local idx="$1" fn="${_MENU_ACCIONES[$1]}" estado
+  printf '\e[?25h\e[H\e[2J'
+  printf '%s> %s) %s%s\n\n' "$C_NEGRITA" "${_MENU_IDS[$idx]}" "${_MENU_ETIQUETAS[$idx]}" "$C_RESET"
+  ( export GIT_PAGER=cat PAGER=cat; "$fn" )
+  estado=$?
+  echo
+  if (( estado == 2 )); then
+    warn "Operación cancelada."
+    return
+  fi
+  printf 'Pulse ENTER para volver al menú...'
+  _menu_esperar_enter
+  printf '\n\e[?25l'
+}
+
+# Selección por número. Si el número puede continuar (p. ej. 1 -> 10..18),
+# espera un segundo una segunda cifra antes de ejecutar la opción de una cifra.
+_menu_por_numero() {
+  local primero="$1" segundo="" idx_uno="" hay_uno=0
+
+  if _menu_indice_de_id "$primero"; then
+    idx_uno="$_MENU_IDX"
+    hay_uno=1
+  fi
+
+  if ! _menu_hay_prefijo "$primero"; then
+    if (( hay_uno )); then
+      _menu_ejecutar "$idx_uno"
+    else
+      warn "No existe la opción ${primero}."
+    fi
+    return
+  fi
+
+  if ! IFS= read -rsn1 -t 1 segundo; then
+    if (( hay_uno )); then
+      _menu_ejecutar "$idx_uno"
+    else
+      warn "No existe la opción ${primero}."
+    fi
+    return
+  fi
+
+  case "$segundo" in
+    [0-9])
+      if _menu_indice_de_id "${primero}${segundo}"; then
+        _menu_ejecutar "$_MENU_IDX"
+      else
+        warn "No existe la opción ${primero}${segundo}."
+      fi
+      ;;
+    $'\e')
+      if _menu_leer_resto_escape; then
+        case "$_ESC_ARROW" in
+          ARRIBA) (( _MENU_SEL > 0 )) && _MENU_SEL=$((_MENU_SEL - 1)) ;;
+          ABAJO)  (( _MENU_SEL < ${#_MENU_IDS[@]} - 1 )) && _MENU_SEL=$((_MENU_SEL + 1)) ;;
+        esac
+      else
+        _menu_salir
+      fi
+      ;;
+    *)
+      if (( hay_uno )); then
+        _menu_ejecutar "$idx_uno"
+      else
+        warn "No existe la opción ${primero}."
+      fi
+      ;;
+  esac
+}
+
+# ---------- Acciones del menú ----------
+_menu_accion_resumen()        { resumen; }
+_menu_accion_status()         { status_completo; }
+_menu_accion_mostrar_remotos() { mostrar_remoto; }
+_menu_accion_pull()           { pull; }
+_menu_accion_push()           { push; }
+_menu_accion_uncommit()       { uncommit; }
+_menu_accion_init()           { inicializar; }
+_menu_accion_ayuda()          { mostrar_ayuda; }
+_menu_accion_salir()          { return 0; }
+
+_menu_accion_log() {
+  local n
+  _leer_linea "Número de commits [10]: " n || return 2
+  ver_log "${n:-10}"
+}
+
+_menu_accion_ramas() {
+  mostrar_rama || return $?
+  local rama
+  _leer_linea "Rama a la que cambiar (ENTER para solo ver): " rama || return 2
+  [[ -z "$rama" ]] && return 0
+  cambiar_rama "$rama"
+}
+
+_menu_accion_nueva_rama() {
+  local rama
+  _leer_linea "Nombre de la nueva rama: " rama || return 2
+  if [[ -z "$rama" ]]; then
+    warn "No se indicó ningún nombre."
+    return 1
+  fi
+  nueva_rama "$rama"
+}
+
+_menu_accion_agregar_remoto() {
+  local url nombre
+  _leer_linea "URL del remoto: " url || return 2
+  if [[ -z "$url" ]]; then
+    warn "No se indicó ninguna URL."
+    return 1
+  fi
+  _leer_linea "Nombre del remoto [origin]: " nombre || return 2
+  agregar_remoto "$url" "${nombre:-origin}"
+}
+
+_menu_accion_seturl_remoto() {
+  local url nombre
+  _leer_linea "Nueva URL del remoto: " url || return 2
+  if [[ -z "$url" ]]; then
+    warn "No se indicó ninguna URL."
+    return 1
+  fi
+  _leer_linea "Nombre del remoto [origin]: " nombre || return 2
+  cambiar_url_remoto "$url" "${nombre:-origin}"
+}
+
+_menu_accion_eliminar_remoto() {
+  local nombre
+  _leer_linea "Nombre del remoto a eliminar [origin]: " nombre || return 2
+  eliminar_remoto "${nombre:-origin}"
+}
+
+_menu_accion_commit() {
+  local mensaje
+  _leer_linea "Mensaje del commit (ENTER usa fecha y hora): " mensaje || return 2
+  commit "$mensaje"
+}
+
+_menu_accion_amend() {
+  local mensaje
+  _leer_linea "Mensaje corregido (ENTER usa fecha y hora): " mensaje || return 2
+  amend "$mensaje"
+}
+
+_menu_mostrar_archivos() {
+  local i
+  info "Archivos modificados o nuevos (${#_ARCHIVOS_MENU[@]}):"
+  for i in "${!_ARCHIVOS_MENU[@]}"; do
+    printf '  %2d) %s\n' "$((i + 1))" "${_ARCHIVOS_MENU[$i]}"
+  done
+  echo
+}
+
+# Traduce la entrada del usuario (número de la lista o nombre) al archivo.
+# Sin entrada devuelve vacío, que significa "todos".
+_menu_resolver_archivo() {
+  local entrada="$1" idx
+  if [[ -z "$entrada" ]]; then
+    return 0
+  fi
+  if [[ "$entrada" =~ ^[0-9]+$ ]]; then
+    idx=$((10#$entrada))
+    if (( idx >= 1 && idx <= ${#_ARCHIVOS_MENU[@]} )); then
+      printf '%s' "${_ARCHIVOS_MENU[$((idx - 1))]}"
+      return 0
+    fi
+    warn "Número de archivo no válido: ${entrada}"
+    return 1
+  fi
+  printf '%s' "$entrada"
+}
+
+_menu_accion_diff_local() {
+  requerir_delta || return 1
+  local base archivo entrada
+  base="$(_rev_local)"
+  mapfile -t _ARCHIVOS_MENU < <(archivos_para_diff "$base")
+
+  if [[ ${#_ARCHIVOS_MENU[@]} -eq 0 ]]; then
+    info "No hay archivos modificados o nuevos."
+    return 0
+  fi
+
+  _menu_mostrar_archivos
+  _leer_linea "Número del archivo o nombre (ENTER para todos, ESC para volver): " entrada || return 2
+  archivo="$(_menu_resolver_archivo "$entrada")" || return 1
+
+  if [[ -z "$archivo" ]]; then
+    _diff_todos "$base"
+  else
+    _diff_archivo "$base" "$archivo"
+  fi
+}
+
+_menu_accion_diff_remote() {
+  requerir_delta || return 1
+
+  if ! tiene_upstream; then
+    error "La rama '$(rama_actual)' no tiene remoto (upstream) configurado."
+    error "Configúrelo ejecutando: $(basename "$0") --push"
+    return 1
+  fi
+
+  local upstream remoto archivo entrada
+  upstream="$(upstream_actual)"
+  remoto="$(remoto_del_upstream "$upstream")"
+
+  info "Actualizando referencias del remoto '${remoto}' (git fetch)..."
+  if ! git fetch "$remoto"; then
+    error "No se pudo actualizar el remoto '${remoto}'."
+    return 1
+  fi
+
+  mapfile -t _ARCHIVOS_MENU < <(archivos_para_diff "$upstream")
+
+  if [[ ${#_ARCHIVOS_MENU[@]} -eq 0 ]]; then
+    info "No hay archivos modificados o nuevos respecto a '${upstream}'."
+    return 0
+  fi
+
+  _menu_mostrar_archivos
+  _leer_linea "Número del archivo o nombre (ENTER para todos, ESC para volver): " entrada || return 2
+  archivo="$(_menu_resolver_archivo "$entrada")" || return 1
+
+  if [[ -z "$archivo" ]]; then
+    _diff_todos "$upstream"
+  else
+    _diff_archivo "$upstream" "$archivo"
+  fi
+}
+
+menu_principal() {
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    error "El menú requiere una terminal interactiva."
+    error "Use las opciones directamente: $(basename "$0") --help"
+    return 1
+  fi
+
+  _menu_inicializar_opciones
+  _MENU_SEL=0
+  printf '\e[?25l'
+  trap 'menu_restaurar_trap' INT TERM
+  trap '_menu_restaurar' EXIT
+
+  while true; do
+    _menu_dibujar
+    _menu_leer_tecla
+    case "$_TECLA" in
+      ARRIBA) (( _MENU_SEL > 0 )) && _MENU_SEL=$((_MENU_SEL - 1)) ;;
+      ABAJO)  (( _MENU_SEL < ${#_MENU_IDS[@]} - 1 )) && _MENU_SEL=$((_MENU_SEL + 1)) ;;
+      ENTER)  _menu_ejecutar "$_MENU_SEL" ;;
+      ESC|EOF) _menu_salir ;;
+      NUM:0)  _menu_salir ;;
+      NUM:*)  _menu_por_numero "${_TECLA#NUM:}" ;;
+    esac
+  done
+}
+
+menu_restaurar_trap() {
+  _menu_restaurar
+  exit 130
 }
 
 # ============================================================
@@ -480,13 +1204,15 @@ case "${1:-}" in
     resumen
     echo
     info "Para ver rama y cambios en el prompt ejecute: source $(basename "$0")"
+    info "Menú interactivo: $(basename "$0") --menu"
     ;;
   -h|--help)   mostrar_ayuda ;;
+  --menu)      menu_principal ;;
   --init)      inicializar ;;
   --commit)    shift; commit "$@" ;;
   --amend)     shift; amend "$@" ;;
   --uncommit)  uncommit ;;
-  --pull)      pull ;;
+  --pull)      shift; pull "$@" ;;
   --push)      push ;;
   --branch)
     shift
