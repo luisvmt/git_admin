@@ -1056,8 +1056,22 @@ _menu_esperar_enter() {
   done
 }
 
+# Texto con el número de cambios sin commit (modificados, preparados y nuevos).
+_menu_texto_cambios() {
+  local cambios
+  cambios="$(cantidad_cambios)"
+  if [[ "$cambios" -eq 0 ]]; then
+    printf 'sin cambios pendientes'
+  elif [[ "$cambios" -eq 1 ]]; then
+    printf '1 cambio sin commit'
+  else
+    printf '%s cambios sin commit' "$cambios"
+  fi
+}
+
+# Cabecera del menú: rama, estado respecto al remoto y cambios sin commit.
 _menu_estado_rama() {
-  local rama upstream atras adelante cambios estado
+  local rama upstream atras adelante estado
   if ! es_repo; then
     printf 'Rama: (no es un repositorio git)'
     return
@@ -1068,28 +1082,17 @@ _menu_estado_rama() {
     upstream="$(upstream_actual)"
     read -r atras adelante < <(contar_divergencia "$upstream")
     if [[ "$atras" -eq 0 && "$adelante" -eq 0 ]]; then
-      printf 'Rama: %s   ·   al día con %s' "$rama" "$upstream"
+      estado="al día con ${upstream}"
     else
-      printf 'Rama: %s   ·   ↑ %s para subir   ·   ↓ %s para bajar' "$rama" "$adelante" "$atras"
+      estado="↑ ${adelante} para subir   ·   ↓ ${atras} para bajar"
     fi
-    return
-  fi
-
-  # Sin upstream: no hay nada que subir ni bajar, pero sí cambios locales.
-  if [[ -n "$(git remote 2>/dev/null)" ]]; then
+  elif [[ -n "$(git remote 2>/dev/null)" ]]; then
     estado="sin upstream en '${rama}'"
   else
     estado="sin remoto configurado"
   fi
 
-  cambios="$(cantidad_cambios)"
-  if [[ "$cambios" -eq 0 ]]; then
-    printf 'Rama: %s   ·   %s   ·   sin cambios pendientes' "$rama" "$estado"
-  elif [[ "$cambios" -eq 1 ]]; then
-    printf 'Rama: %s   ·   %s   ·   1 cambio sin commit' "$rama" "$estado"
-  else
-    printf 'Rama: %s   ·   %s   ·   %s cambios sin commit' "$rama" "$estado" "$cambios"
-  fi
+  printf 'Rama: %s   ·   %s   ·   %s' "$rama" "$estado" "$(_menu_texto_cambios)"
 }
 
 _menu_dibujar() {
