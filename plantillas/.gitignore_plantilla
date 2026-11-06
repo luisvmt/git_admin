@@ -59,8 +59,8 @@ build/
 *.class
 
 # Secretos y entorno
-.secrets*
-/secrets/
+.secrets/
+secrets/
 .env*
 !.env.example
 *.pem
@@ -134,4 +134,3 @@ implementation_plan.md
 modelos_prompt.md
 /config/
 instalador/
-!plantillas/

@@ -272,6 +272,10 @@ _copiar_plantillas() {
     return 1
   fi
 
+  # Los destinos son los nombres reales. Las plantillas viven en la misma
+  # carpeta con el sufijo _plantilla en su primer componente:
+  #   .gitignore            <- .gitignore_plantilla
+  #   custom_scripts/x.sh   <- custom_scripts_plantilla/x.sh
   local -a archivos=(
     ".clineignore"
     ".clinerules"
@@ -285,11 +289,15 @@ _copiar_plantillas() {
   )
 
   for archivo in "${archivos[@]}"; do
-    origen="$plantillas/$archivo"
+    if [[ "$archivo" == */* ]]; then
+      origen="$plantillas/${archivo%%/*}_plantilla/${archivo#*/}"
+    else
+      origen="$plantillas/${archivo}_plantilla"
+    fi
     destino="$archivo"
 
     if [[ ! -e "$origen" ]]; then
-      warn "Falta la plantilla: ${archivo}"
+      warn "Falta la plantilla: ${origen}"
       faltantes=$((faltantes + 1))
       continue
     fi

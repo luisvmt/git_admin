@@ -1,0 +1,29 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "litellm": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "name": "LiteLLM",
+      "settings": {
+        "baseURL": "http://localhost:4000/v1",
+        "apiKey": "{file:~/.secrets/litellm_api_key}"
+      },
+      "models": {
+        "claude-haiku-opencodego": {
+          "name": "Claude Haiku (vía LiteLLM)"
+        },
+        "deepseek-v4.1-flash-opencodego": {
+          "name": "DeepSeek V4.1 Flash (vía LiteLLM)"
+        }
+      }
+    }
+  },
+  "agents": {
+    "plan": {
+      "model": "litellm/claude-haiku-opencodego"
+    },
+    "build": {
+      "model": "litellm/deepseek-v4.1-flash-opencodego"
+    }
+  }
+}
